@@ -350,7 +350,7 @@ apiRouter.post("/campaigns", async (req, res) => {
     const userId = getUserId(req);
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const { name, delayMin, delayMax, subject, body, leads } = req.body;
+    const { name, delayMin, delayMax, subject, body, leads, accountIds } = req.body;
 
     const { data: campaign, error: cError } = await supabase
         .from("campaigns")
@@ -361,6 +361,7 @@ apiRouter.post("/campaigns", async (req, res) => {
             delay_max: delayMax,
             subject,
             body,
+            account_ids: accountIds || null,
             status: 'paused' // Start as paused to avoid race condition with queue worker
         }])
         .select()

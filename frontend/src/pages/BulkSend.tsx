@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
 import { toast } from "sonner";
 import api from "@/lib/api";
 import { useNavigate } from "react-router-dom";
@@ -22,6 +23,10 @@ export default function BulkSend() {
     const [step, setStep] = useState(1);
     const [isSubmitting, setIsSubmitting] = useState(false);
 
+    // Accounts State
+    const [accounts, setAccounts] = useState<any[]>([]);
+    const [selectedAccounts, setSelectedAccounts] = useState<string[]>([]);
+
     // Form State
     const [name, setName] = useState("");
     const [delayMin, setDelayMin] = useState(60);
@@ -31,6 +36,21 @@ export default function BulkSend() {
     const [csvData, setCsvData] = useState<any[]>([]);
     const [subject, setSubject] = useState("");
     const [body, setBody] = useState("");
+
+    useEffect(() => {
+        const fetchAccounts = async () => {
+            try {
+                const { data } = await api.get("/accounts");
+                const eligible = data.filter((a: any) => a.allow_campaign_sending !== false);
+                setAccounts(eligible);
+                // By default, select all eligible accounts
+                setSelectedAccounts(eligible.map((a: any) => a.id));
+            } catch (err) {
+                console.error("Failed to fetch accounts:", err);
+            }
+        };
+        fetchAccounts();
+    }, []);
 
     useEffect(() => {
         if (!csvRaw.trim()) {
@@ -129,7 +149,7 @@ export default function BulkSend() {
             console.log(`Submitting campaign with ${leads.length} leads.`, { name, leadsSample: leads.slice(0, 1) });
 
             const response = await api.post(`/campaigns`, {
-                name, delayMin, delayMax, subject, body, leads
+                name, delayMin, delayMax, subject, body, leads, accountIds: selectedAccounts
             });
 
             console.log("Response:", response.data);
@@ -184,6 +204,48 @@ export default function BulkSend() {
                                 </div>
                             </div>
                             <p className="text-xs text-muted-foreground">The system will wait a random duration between Min and Max Delay before sending each next email, mimicking human behavior.</p>
+                            
+                            <div className="pt-4 border-t space-y-3">
+                                <div className="flex items-center justify-between">
+                                    <Label className="text-base font-medium">Sending Accounts</Label>
+                                    <Button 
+                                        variant="ghost" 
+                                        size="sm" 
+                                        onClick={() => setSelectedAccounts(selectedAccounts.length === accounts.length ? [] : accounts.map(a => a.id))}
+                                    >
+                                        {selectedAccounts.length === accounts.length ? "Deselect All" : "Select All"}
+                                    </Button>
+                                </div>
+                                <p className="text-xs text-muted-foreground">Select which email accounts will be used to send this campaign. Ensure at least one is selected.</p>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[200px] overflow-y-auto p-1">
+                                    {accounts.map(acc => (
+                                        <div key={acc.id} className="flex items-start space-x-3 p-3 rounded-md border bg-card hover:bg-muted/50 transition-colors">
+                                            <Checkbox 
+                                                id={`acc-${acc.id}`} 
+                                                checked={selectedAccounts.includes(acc.id)}
+                                                onCheckedChange={(checked) => {
+                                                    if (checked) {
+                                                        setSelectedAccounts([...selectedAccounts, acc.id]);
+                                                    } else {
+                                                        setSelectedAccounts(selectedAccounts.filter(id => id !== acc.id));
+                                                    }
+                                                }}
+                                            />
+                                            <div className="flex flex-col space-y-1 leading-none">
+                                                <label htmlFor={`acc-${acc.id}`} className="text-sm font-medium cursor-pointer">
+                                                    {acc.display_name || acc.email}
+                                                </label>
+                                                <p className="text-xs text-muted-foreground">{acc.email}</p>
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {accounts.length === 0 && (
+                                        <div className="text-sm text-muted-foreground col-span-2 p-4 border border-dashed rounded-md text-center">
+                                            No eligible accounts found. Please add an account in Settings first.
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
                         </div>
                     )}
 
@@ -257,6 +319,7 @@ export default function BulkSend() {
                                 <div className="flex justify-between border-b pb-2"><span className="text-muted-foreground">Campaign:</span> <span className="font-medium">{name || "Unnamed"}</span></div>
                                 <div className="flex justify-between border-b py-2"><span className="text-muted-foreground">Valid Leads Found:</span> <span className={`font-bold ${validLeads.length > 0 ? "text-green-600" : "text-destructive"}`}>{validLeads.length}</span></div>
                                 <div className="flex justify-between border-b py-2"><span className="text-muted-foreground">Inter-Send Delay:</span> <span className="font-medium">{delayMin}s - {delayMax}s</span></div>
+                                <div className="flex justify-between py-2"><span className="text-muted-foreground">Selected Accounts:</span> <span className="font-medium">{selectedAccounts.length} / {accounts.length}</span></div>
                             </div>
 
                             <div className="rounded-lg border p-4 space-y-2">

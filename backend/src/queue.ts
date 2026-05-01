@@ -50,7 +50,7 @@ async function processQueue() {
             const lead = leads?.[0];
 
             if (lead) {
-                const account = await getAvailableAccount(campaign.user_id);
+                const account = await getAvailableAccount(campaign.user_id, campaign.account_ids);
                 if (account) {
                     const transporter = createTransporter(account);
                     const personalizedSubject = personalize(campaign.subject, lead);
@@ -235,16 +235,23 @@ async function processFollowupSteps(campaign: any) {
 
 // ── Helpers ────────────────────────────────────────────
 
-async function getAvailableAccount(userId: string) {
-    const { data: allAccounts, error } = await supabase
+async function getAvailableAccount(userId: string, accountIds: string[] | null = null) {
+    let query = supabase
         .from("accounts")
         .select("*")
         .eq("user_id", userId);
 
+    const { data: allAccounts, error } = await query;
+
     if (error) throw error;
 
+    let targetAccounts = allAccounts || [];
+    if (accountIds && Array.isArray(accountIds) && accountIds.length > 0) {
+        targetAccounts = targetAccounts.filter(acc => accountIds.includes(acc.id));
+    }
+
     const available = [];
-    for (const acc of allAccounts || []) {
+    for (const acc of targetAccounts) {
         // Skip accounts that have campaign sending explicitly disabled
         if (acc.allow_campaign_sending === false) continue;
 
