@@ -136,6 +136,16 @@ async function processQueue() {
                 campaign.status = "running";
                 console.log(`[Queue] Scheduled campaign "${campaign.name}" is now due. Starting campaign execution.`);
             }
+
+            // ── Distributed processing lock ──────────────────────────────────────────────
+            // Immediately push next_run_at 60s into the future so that if another server
+            // instance (e.g. the remote server) polls within that window, it won't see this
+            // campaign as due and race us to process it.
+            await supabase
+                .from("campaigns")
+                .update({ next_run_at: new Date(Date.now() + 60000).toISOString() })
+                .eq("id", campaign.id);
+
             // ── Initial send: find pending leads in batches to handle duplicates efficiently ──
             const { data: pendingLeads, error: lError } = await supabase
                 .from("leads")
