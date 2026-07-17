@@ -1,4 +1,6 @@
 import net from 'net';
+import https from 'https';
+import http from 'http';
 
 /**
  * Enhanced SMTP Validator — fast, accurate, enterprise-grade
@@ -41,11 +43,56 @@ export class SMTPValidator {
         'live.com', 'msn.com', 'ymail.com', 'me.com', 'mac.com'
     ]);
 
-    // Try port 25 first, then 587 as fallback (ISPs often block outbound 25)
+    // Try port 25 first, then 587 as fallback
     private static readonly SMTP_PORTS = [25, 587] as const;
 
     // Max emails per single SMTP connection — many servers cap recipients per session
     private static readonly SMTP_SESSION_CHUNK = 15;
+
+    // Cache port-25 reachability per MX host for the lifetime of the process
+    private static readonly port25Cache = new Map<string, boolean>();
+
+    private static readonly PORT25_API_KEY = 'mattew-p25-9k3x';
+    private static readonly PORT25_API_BASE = 'http://87.99.139.116:4001/check-port25';
+
+    /**
+     * Check if port 25 is reachable on a given MX host using the external API.
+     * Returns true if port 25 is open, false if blocked.
+     * Falls back to true (optimistic) if the API is unreachable.
+     */
+    private static async isPort25Open(mxHost: string): Promise<boolean> {
+        if (this.port25Cache.has(mxHost)) {
+            return this.port25Cache.get(mxHost)!;
+        }
+
+        try {
+            const url = `${this.PORT25_API_BASE}?host=${encodeURIComponent(mxHost)}&key=${this.PORT25_API_KEY}`;
+            const result = await new Promise<boolean>((resolve) => {
+                const req = http.get(url, { timeout: 5000 }, (res) => {
+                    let body = '';
+                    res.on('data', (chunk) => body += chunk);
+                    res.on('end', () => {
+                        try {
+                            const json = JSON.parse(body);
+                            // API returns { open: true/false } or { reachable: true/false } or { port25: true/false }
+                            const isOpen = json.open ?? json.reachable ?? json.port25 ?? json.success ?? true;
+                            resolve(!!isOpen);
+                        } catch {
+                            resolve(true); // Can't parse — assume open
+                        }
+                    });
+                });
+                req.on('timeout', () => { req.destroy(); resolve(true); });
+                req.on('error', () => resolve(true)); // API down — assume open
+            });
+
+            this.port25Cache.set(mxHost, result);
+            console.log(`[Port25] ${mxHost}: port 25 is ${result ? 'OPEN' : 'BLOCKED'}`);
+            return result;
+        } catch {
+            return true; // Fail open
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Single-email verification
@@ -85,7 +132,12 @@ export class SMTPValidator {
 
         let lastResult: SMTPValidationResult | null = null;
 
-        for (const port of this.SMTP_PORTS) {
+        // Determine which ports to try based on port-25 reachability
+        const port25Open = await this.isPort25Open(mxHost);
+        const portsToTry = port25Open ? this.SMTP_PORTS : ([587] as const);
+        if (!port25Open) console.log(`[Port25] Skipping port 25 for ${mxHost} — blocked, using port 587 directly`);
+
+        for (const port of portsToTry) {
             for (let attempt = 0; attempt <= retries; attempt++) {
                 const result = await this.attemptVerification(email, mxHost, port, timeout, fromEmail, fromDomain);
                 lastResult = result;
@@ -151,7 +203,18 @@ export class SMTPValidator {
 
         let pendingEmails = [...emails];
 
-        for (const port of this.SMTP_PORTS) {
+        // Determine which ports to try based on port-25 reachability
+        const port25Open = await this.isPort25Open(mxHost);
+        const portsToTry = port25Open ? this.SMTP_PORTS : ([587] as const);
+        if (!port25Open) console.log(`[Port25] Skipping port 25 for ${mxHost} — blocked, using port 587 directly`);
+
+        for (const port of portsToTry) {
+            if (pendingEmails.length === 0) break;
+
+            // Emails that remain low-confidence on ALL retries for this port
+            // will be passed to the next port (e.g. 25 → 587)
+            let remainingForNextPort: string[] = [];
+
             for (let attempt = 0; attempt <= retries; attempt++) {
                 if (pendingEmails.length === 0) break;
 
@@ -166,19 +229,20 @@ export class SMTPValidator {
                     const r = await this.attemptBulkVerification(chunk, mxHost, port, timeout, fromEmail, fromDomain);
                     for (const [e, v] of r) chunkResultsMap.set(e, v);
                 }
-                const batchResults = chunkResultsMap;
 
                 const retryEmails: string[] = [];
-                for (const [email, result] of batchResults.entries()) {
+                for (const [email, result] of chunkResultsMap.entries()) {
                     const localPart = email.split('@')[0]?.toLowerCase();
                     const isRoleAccount = this.ROLE_ACCOUNTS.has(localPart);
 
                     if (result.confidence === 'high' || result.confidence === 'medium') {
                         results.set(email, this.annotateRoleAccount(result, isRoleAccount));
                     } else if (attempt < retries) {
+                        // Retry on same port
                         retryEmails.push(email);
                     } else {
-                        results.set(email, this.annotateRoleAccount(result, isRoleAccount));
+                        // Last retry on this port — hold for next port instead of committing
+                        remainingForNextPort.push(email);
                     }
                 }
 
@@ -187,7 +251,9 @@ export class SMTPValidator {
                     await this.sleep(Math.min(1500 * Math.pow(2, attempt), 6000));
                 }
             }
-            if (pendingEmails.length === 0) break;
+
+            // Carry unresolved emails forward to the next port
+            pendingEmails = remainingForNextPort;
         }
 
         // Anything still pending after all ports → mark as low-confidence
@@ -195,7 +261,7 @@ export class SMTPValidator {
             const localPart = email.split('@')[0]?.toLowerCase();
             results.set(email, this.annotateRoleAccount({
                 valid: false, deliverable: false,
-                message: 'Unable to verify — all connection attempts failed',
+                message: 'Unable to verify — all ports and retries exhausted',
                 confidence: 'low'
             }, this.ROLE_ACCOUNTS.has(localPart)));
         }
