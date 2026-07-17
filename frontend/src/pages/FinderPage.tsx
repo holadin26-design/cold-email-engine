@@ -26,6 +26,36 @@ type BulkResult = {
     confidence?: string;
 };
 
+const verifyEmailsExternal = async (emails: string[], signal: AbortSignal) => {
+    try {
+        const { data } = await api.post('/finder/verify-bulk', { emails }, { signal });
+
+        // Backend returns { results: [...] } — normalise to the shape callers expect
+        const results = (data.results || []).map((r: any) => ({
+            email: r.email,
+            status: r.status as StatusType,
+            message: r.message,
+            confidence: r.confidence,
+            recommendation: r.recommendation,
+        }));
+
+        return { data: { results } };
+    } catch (err: any) {
+        if (err.name === 'AbortError' || err.name === 'CanceledError') throw err;
+        return {
+            data: {
+                results: emails.map(email => ({
+                    email,
+                    status: 'invalid' as StatusType,
+                    message: 'Validation error',
+                    confidence: 'Low',
+                    recommendation: 'Do not send'
+                }))
+            }
+        };
+    }
+};
+
 export default function FinderPage() {
     const [activeTab, setActiveTab] = useState('single');
 
@@ -75,7 +105,7 @@ export default function FinderPage() {
             setResults(patterns.map((p: string) => ({ email: p, status: 'unknown' as StatusType })));
 
             try {
-                const { data } = await api.post("/finder/verify-bulk", { emails: patterns }, { signal: controller.signal });
+                const { data } = await verifyEmailsExternal(patterns, controller.signal);
                 if (!controller.signal.aborted && data?.results) {
                     setResults(patterns.map((p: string) => {
                         const verified = data.results.find((r: any) => r.email === p);
@@ -171,7 +201,7 @@ export default function FinderPage() {
 
                         setFinderResults(prev => prev.map(r => r.id === `f-${targetIndex}` ? { ...r, email: `Verifying ${patterns.length} patterns...`, status: 'unknown' } : r));
 
-                        const { data } = await api.post("/finder/verify-bulk", { emails: patterns }, { signal: controller.signal });
+                        const { data } = await verifyEmailsExternal(patterns, controller.signal);
 
                         if (controller.signal.aborted) return null;
 
@@ -265,88 +295,35 @@ export default function FinderPage() {
             id: `v-${i}`,
             input: email,
             email,
-            status: 'pending'
+            status: 'pending' as StatusType
         })));
 
-        const TARGET_CONCURRENCY = 5;
-        skipValidatorIndicesRef.current.clear();
-        activeValidatorIndicesRef.current.clear();
+        try {
+            // Send all emails in one batch
+            const { data } = await verifyEmailsExternal(uniqueEmails, controller.signal);
 
-        const processEmail = async (email: string, index: number) => {
-            if (controller.signal.aborted) return null;
+            if (controller.signal.aborted) return;
 
-            activeValidatorIndicesRef.current.add(index);
-            const targetId = `v-${index}`;
-
-            const MAX_RETRIES = 2;
-            try {
-                for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-                    if (controller.signal.aborted) return null;
-                    if (skipValidatorIndicesRef.current.has(index)) {
-                        setValidatorResults(prev => prev.map(r => r.id === targetId ? { ...r, status: 'skipped' } : r));
-                        return { status: 'skipped' };
-                    }
-
-                    try {
-                        setValidatorResults(prev => prev.map(r => r.id === targetId ? { ...r, status: 'unknown' } : r));
-
-                        const { data } = await api.post(
-                            '/finder/verify-bulk',
-                            { emails: [email] },
-                            { signal: controller.signal }
-                        );
-
-                        if (controller.signal.aborted || skipValidatorIndicesRef.current.has(index)) return null;
-
-                        const result = data?.results?.[0];
-                        if (result) {
-                            setValidatorResults(prev => prev.map(r => r.id === targetId ? { 
-                                ...r, 
-                                status: result.status as StatusType, 
-                                message: result.message 
-                            } : r));
-                            return result;
-                        } else {
-                            throw new Error("No result returned from server");
-                        }
-                    } catch (err: any) {
-                        if (controller.signal.aborted || err.name === 'CanceledError') return null;
-                        const isNetworkError = err.code === 'ERR_NETWORK' || err.message?.includes('Network Error') || err.response?.status >= 500;
-                        if (isNetworkError && attempt < MAX_RETRIES) {
-                            await new Promise(resolve => setTimeout(resolve, 2000 * Math.pow(2, attempt)));
-                            continue;
-                        }
-                        console.error("Email validation failed", err);
-                        const errMsg = err.response?.data?.message || err.message || 'Network error';
-                        setValidatorResults(prev => prev.map(r => r.id === targetId ? { ...r, status: 'invalid', message: errMsg } : r));
-                        return { status: 'invalid', message: errMsg };
-                    }
-                }
-            } finally {
-                activeValidatorIndicesRef.current.delete(index);
+            if (data?.results) {
+                setValidatorResults(uniqueEmails.map((email, i) => {
+                    const result = data.results.find((r: any) => r.email === email);
+                    return {
+                        id: `v-${i}`,
+                        input: email,
+                        email,
+                        status: (result?.status as StatusType) || 'invalid',
+                        message: result?.message
+                    };
+                }));
             }
-            return null;
-        };
-
-        let nextIndex = 0;
-        const worker = async () => {
-            while (nextIndex < uniqueEmails.length && !controller.signal.aborted) {
-                const currentIndex = nextIndex++;
-                const email = uniqueEmails[currentIndex];
-                if (!email) break;
-
-                await processEmail(email, currentIndex);
-
-                if (!controller.signal.aborted) {
-                    await new Promise(resolve => setTimeout(resolve, 400));
-                }
+        } catch (err: any) {
+            if (!controller.signal.aborted && err.name !== 'CanceledError') {
+                toast.error('Verification failed: ' + (err.response?.data?.error || err.message));
+                setValidatorResults(prev => prev.map(r => ({ ...r, status: 'invalid' as StatusType, message: 'Request failed' })));
             }
-        };
-
-        const workers = Array.from({ length: Math.min(TARGET_CONCURRENCY, uniqueEmails.length) }, () => worker());
-        await Promise.all(workers);
-
-        if (!controller.signal.aborted) setIsValidating(false);
+        } finally {
+            if (!controller.signal.aborted) setIsValidating(false);
+        }
     };
 
     const exportCSV = (results: BulkResult[], filename: string) => {
